@@ -11,3 +11,9 @@ __pycache__/
 # OS / IDE
 .DS_Store
 .vscode/
+
+
+# generated outputs
+results/
+data/interim/
+data/processed/
