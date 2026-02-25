@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 import pandas as pd
+import os
 
 from src.action_queue import ActionQueueBuilder
 from src.config import default_paths
@@ -15,6 +16,7 @@ from src.root_cause import RootCauseAnalyzer
 def run() -> None:
     
     paths = default_paths()
+    debug = os.getenv("DEBUG", "0") == "1"
 
     # 1) Load
     df = pd.read_csv(paths.data / "raw" / "dataset_ecommerce_hourly.csv")
@@ -34,16 +36,17 @@ def run() -> None:
     df_features = fs.get_df()
 
     # Optional debug print (keep for now)
-    print(
-        df_features[
-            [
-                "Buyers_Orders_Created",
-                "Buyers_Orders_Created_zscore",
-                "CR_Orders_Created",
-                "CR_Orders_Created_zscore",
-            ]
-        ].tail(10)
-    )
+    if debug:
+        print(
+            df_features[
+                [
+                    "Buyers_Orders_Created",
+                    "Buyers_Orders_Created_zscore",
+                    "CR_Orders_Created",
+                    "CR_Orders_Created_zscore",
+                ]
+            ].tail(10)
+        )
 
 
     rca = RootCauseAnalyzer(df_features)
@@ -138,8 +141,9 @@ def run() -> None:
         all_events += ews.build_watchlist("CR_Orders_Created", top_k=3)
 
 
-    print("Summary:", ews.summary("Buyers_Orders_Created"))
-    print("Summary:", ews.summary("CR_Orders_Created"))
+        if debug:
+            print("Summary:", ews.summary("Buyers_Orders_Created"))
+            print("Summary:", ews.summary("CR_Orders_Created"))
 
     # Enrich EarlyWarning events with root-cause hints + sharper action text
     for e in all_events:
