@@ -5,20 +5,27 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Tuple
 
 
 @dataclass
-class Buckets:
-    risks: List[Dict[str, Any]]
-    opportunities: List[Dict[str, Any]]
-    watchlist: List[Dict[str, Any]]
+class BudgetConfig:
+    # hard limit how many "do this today" items we show
+    max_focus_items: int = 3
+    # maximum watchlist rows in table
+    max_watchlist_rows: int = 12
 
 
 class ReportBuilder:
-    def __init__(self, action_queue_path: Path, output_path: Path):
+    def __init__(
+        self,
+        action_queue_path: Path,
+        output_path: Path,
+        budget: BudgetConfig = BudgetConfig(),
+    ) -> None:
         self.action_queue_path = action_queue_path
         self.output_path = output_path
+        self.budget = budget
 
     def load_items(self) -> List[Dict[str, Any]]:
         if not self.action_queue_path.exists():
@@ -26,110 +33,147 @@ class ReportBuilder:
         return json.loads(self.action_queue_path.read_text(encoding="utf-8"))
 
     @staticmethod
-    def _bucket(items: List[Dict[str, Any]]) -> Buckets:
-        risks = [x for x in items if x.get("issue_type") in ("EarlyWarning", "DataQuality")]
-        opportunities = [x for x in items if x.get("issue_type") == "Opportunity"]
-        watchlist = [x for x in items if x.get("issue_type") == "Watchlist"]
-        return Buckets(risks=risks, opportunities=opportunities, watchlist=watchlist)
+    def _section(title: str) -> str:
+        return f"\n\n## {title}\n\n"
 
     @staticmethod
-    def _h2(title: str) -> str:
-        return f"\n## {title}\n"
-
-    @staticmethod
-    def _fmt_conf(x: Dict[str, Any]) -> str:
+    def _as_float(x: Any, default: float = 0.0) -> float:
         try:
-            return f"{float(x.get('confidence', 0.0)):.2f}"
+            return float(x)
         except Exception:
-            return str(x.get("confidence", ""))
+            return default
 
     @staticmethod
-    def _breach_examples(item: Dict[str, Any], max_n: int = 6) -> Optional[str]:
-        extra = item.get("extra") or {}
-        examples = extra.get("breach_examples")
-        if not examples:
-            return None
-        return ", ".join(examples[:max_n])
+    def _as_int(x: Any, default: int = 0) -> int:
+        try:
+            return int(x)
+        except Exception:
+            return default
 
-    @staticmethod
-    def _topline(b: Buckets) -> str:
-        parts = []
-        if b.risks:
-            parts.append(f"🔴 {len(b.risks)} risk(s)")
-        if b.opportunities:
-            parts.append(f"🟢 {len(b.opportunities)} opportunity(s)")
-        if b.watchlist:
-            parts.append(f"🟡 {len(b.watchlist)} watchlist item(s)")
-        return " / ".join(parts) if parts else "No signals detected."
+    def _priority_key(self, item: Dict[str, Any]) -> Tuple[int, float]:
+        """
+        Higher is better.
+        Use severity first, then confidence.
+        """
+        return (self._as_int(item.get("severity", 0)), self._as_float(item.get("confidence", 0.0)))
 
-    @staticmethod
-    def _next_actions(b: Buckets) -> List[str]:
-        actions: List[str] = []
-        if b.risks:
-            r = b.risks[0]
-            actions.append(f"Address risk: **{r['metric']}** → {r['recommended_action']}")
-        if b.opportunities:
-            o = b.opportunities[0]
-            actions.append(f"Exploit opportunity: **{o['metric']}** → {o['recommended_action']}")
-        if not actions and b.watchlist:
-            w = b.watchlist[0]
-            actions.append(f"Monitor: **{w['metric']}** → {w['signal']}")
-        return actions
+    def _bucket(self, items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        b: Dict[str, List[Dict[str, Any]]] = {
+            "Risks": [],
+            "Opportunities": [],
+            "Watchlist": [],
+            "Other": [],
+        }
 
-    @staticmethod
-    def _format_opportunity(item: Dict[str, Any]) -> str:
-        lines = [
-            f"### {item['metric']}",
-            f"- **Signal:** {item['signal']}",
-            f"- **Impact:** {item['expected_impact']}",
-            f"- **Why now:** {item.get('why_now','')}",
-        ]
-        ex = ReportBuilder._breach_examples(item)
-        if ex:
-            lines.append(f"- **Breach examples:** {ex}")
-        lines += [
-            f"- **Action:** {item['recommended_action']}",
-            f"- **Owner:** {item['owner_hint']}",
-            f"- **Confidence:** {ReportBuilder._fmt_conf(item)}",
-        ]
-        return "  \n".join(lines) + "  \n"
+        for x in items:
+            t = x.get("issue_type", "Other")
+            if t in ("EarlyWarning", "DataQuality", "Drift", "Instability"):
+                b["Risks"].append(x)
+            elif t == "Opportunity":
+                b["Opportunities"].append(x)
+            elif t == "Watchlist":
+                b["Watchlist"].append(x)
+            else:
+                b["Other"].append(x)
 
-    @staticmethod
-    def _format_risk(item: Dict[str, Any]) -> str:
-        lines = [
-            f"### {item['metric']}",
-            f"- **Signal:** {item['signal']}",
-            f"- **Severity:** {item['severity']} / 5",
-            f"- **Impact:** {item['expected_impact']}",
-            f"- **Why now:** {item.get('why_now','')}",
-        ]
-        ex = ReportBuilder._breach_examples(item)
-        if ex:
-            lines.append(f"- **Breach examples:** {ex}")
-        lines += [
-            f"- **Action:** {item['recommended_action']}",
-            f"- **Owner:** {item['owner_hint']}",
-            f"- **Verify:** {item.get('verification_step','')}",
-            f"- **Confidence:** {ReportBuilder._fmt_conf(item)}",
-        ]
-        return "  \n".join(lines) + "  \n"
+        # Sort each bucket by our priority key
+        for k in b:
+            b[k] = sorted(b[k], key=self._priority_key, reverse=True)
 
-    @staticmethod
-    def _watchlist_table(items: List[Dict[str, Any]], max_rows: int = 12) -> str:
-        rows = items[:max_rows]
-        if not rows:
-            return "_No watchlist items._\n"
+        return b
 
-        out = [
-            "| Metric | Signal | Impact | Owner | Confidence |",
-            "|---|---|---:|---|---:|",
-        ]
+    def _render_focus_list(self, items: List[Dict[str, Any]]) -> str:
+        """
+        Renders a compact "today" list, obeying alert budget.
+        """
+        if not items:
+            return ""
+
+        top = items[: self.budget.max_focus_items]
+        lines = ["**What to do next (today):**"]
+        for x in top:
+            metric = x.get("metric", "")
+            action = x.get("recommended_action", "")
+            lines.append(f"- {metric}: **{action}**")
+        if len(items) > len(top):
+            lines.append(
+                f"\n_Alert budget: showing top {len(top)} items to prevent noise. "
+                f"{len(items) - len(top)} additional items are listed below._"
+            )
+        return "\n".join(lines) + "\n"
+
+    def _render_opportunities(self, items: List[Dict[str, Any]]) -> str:
+        if not items:
+            return ""
+        out: List[str] = [self._section("🟢 Opportunities")]
+
+        for x in items[: self.budget.max_focus_items]:
+            out.append(f"### {x.get('metric','')}")
+            out.append(f"- **Signal:** {x.get('signal','')}")
+            out.append(f"- **Impact:** {x.get('expected_impact','')}")
+            out.append(f"- **Why now:** {x.get('why_now','')}")
+            extra = x.get("extra", {}) or {}
+            if "breach_examples" in extra and extra["breach_examples"]:
+                be = ", ".join(map(str, extra["breach_examples"][:6]))
+                out.append(f"- **Breach examples:** {be}")
+            out.append(f"- **Action:** {x.get('recommended_action','')}")
+            out.append(f"- **Owner:** {x.get('owner_hint','')}")
+            out.append(f"- **Confidence:** {x.get('confidence','')}")
+            out.append("")  # blank line
+
+        if len(items) > self.budget.max_focus_items:
+            out.append(
+                f"_Showing top {self.budget.max_focus_items} opportunities. "
+                f"Remaining {len(items)-self.budget.max_focus_items} are deprioritized by alert budget._\n"
+            )
+        return "\n".join(out)
+
+    def _render_risks(self, items: List[Dict[str, Any]]) -> str:
+        if not items:
+            return ""
+        out: List[str] = [self._section("🔴 Risks")]
+
+        for x in items[: self.budget.max_focus_items]:
+            out.append(f"### {x.get('metric','')}")
+            out.append(f"- **Signal:** {x.get('signal','')}")
+            out.append(f"- **Impact:** {x.get('expected_impact','')}")
+            out.append(f"- **Why now:** {x.get('why_now','')}")
+            out.append(f"- **Action:** {x.get('recommended_action','')}")
+            out.append(f"- **Owner:** {x.get('owner_hint','')}")
+            out.append(f"- **Confidence:** {x.get('confidence','')}")
+            extra = x.get("extra", {}) or {}
+            rc = extra.get("root_cause") if isinstance(extra, dict) else None
+            if isinstance(rc, dict) and rc.get("reason"):
+                out.append(f"- **Root-cause hint:** `{rc.get('reason')}`")
+            out.append("")  # blank line
+
+        if len(items) > self.budget.max_focus_items:
+            out.append(
+                f"_Showing top {self.budget.max_focus_items} risks. "
+                f"Remaining {len(items)-self.budget.max_focus_items} are deprioritized by alert budget._\n"
+            )
+        return "\n".join(out)
+
+    def _render_watchlist_table(self, items: List[Dict[str, Any]]) -> str:
+        if not items:
+            return ""
+
+        rows = items[: self.budget.max_watchlist_rows]
+        out: List[str] = [self._section("🟡 Watchlist")]
+
+        out.append("| Metric | Signal | Impact | Owner | Confidence |")
+        out.append("|---|---|---:|---|---:|")
         for x in rows:
             out.append(
-                f"| {x.get('metric','')} | {x.get('signal','')} | {x.get('expected_impact','')} | "
-                f"{x.get('owner_hint','')} | {ReportBuilder._fmt_conf(x)} |"
+                f"| {x.get('metric','')} | {x.get('signal','')} | {x.get('expected_impact','')} | {x.get('owner_hint','')} | {x.get('confidence','')} |"
             )
-        return "\n".join(out) + "\n"
+
+        if len(items) > len(rows):
+            out.append(
+                f"\n_Only showing top {len(rows)} watchlist rows. "
+                f"{len(items)-len(rows)} more exist in action_queue.csv._\n"
+            )
+        return "\n".join(out)
 
     def build(self) -> None:
         items = self.load_items()
@@ -137,35 +181,39 @@ class ReportBuilder:
 
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
+        risks = b["Risks"]
+        opps = b["Opportunities"]
+        watch = b["Watchlist"]
+
         content: List[str] = []
         content.append("# Weekly Behavioral Monitoring Brief")
-        content.append(f"_Generated: {now}_")
-        content.append("")
-        content.append(f"**Topline:** {self._topline(b)}")
-        content.append("")
+        content.append(f"_Generated: {now}_\n")
 
-        next_actions = self._next_actions(b)
-        if next_actions:
-            content.append("**What to do next (today):**")
-            for a in next_actions:
-                content.append(f"- {a}")
-            content.append("")
+        # topline
+        content.append(
+            f"**Topline:** 🔴 {len(risks)} risk(s) / 🟢 {len(opps)} opportunity(s) / 🟡 {len(watch)} watchlist item(s)\n"
+        )
 
-        if b.risks:
-            content.append(self._h2("🔴 Risks"))
-            for r in b.risks:
-                content.append(self._format_risk(r))
+        # "today" list obeying budget: prioritize risks then opps
+        focus_pool = sorted((risks + opps), key=self._priority_key, reverse=True)
+        if focus_pool:
+            content.append(self._render_focus_list(focus_pool))
+        else:
+            content.append("**What to do next (today):**\n- No critical items. Review watchlist and keep monitoring.\n")
 
-        if b.opportunities:
-            content.append(self._h2("🟢 Opportunities"))
-            for o in b.opportunities:
-                content.append(self._format_opportunity(o))
+        # sections
+        r = self._render_risks(risks)
+        if r:
+            content.append(r)
 
-        content.append(self._h2("🟡 Watchlist"))
-        content.append(self._watchlist_table(b.watchlist, max_rows=12))
+        o = self._render_opportunities(opps)
+        if o:
+            content.append(o)
 
-        if not items:
-            content.append("\n_No alerts or signals detected._\n")
+        w = self._render_watchlist_table(watch)
+        if w:
+            content.append(w)
 
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.output_path.write_text("\n".join(content).strip() + "\n", encoding="utf-8")
+        
